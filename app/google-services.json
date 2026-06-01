@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "109387357949",
+    "project_id": "taxipilot-5fd10",
+    "storage_bucket": "taxipilot-5fd10.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:109387357949:android:aee4d6ab2c462457a12894",
+        "android_client_info": {
+          "package_name": "com.example.taxipilot"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCAOXWG4p9vxFf-ZsgZNhIyI0Y0pf4z5h0"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
