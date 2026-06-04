@@ -1,5 +1,12 @@
 package com.example.taxipilot.auth
 
+// Écran de liage Chauffeur ↔ Propriétaire.
+// Affiché UNIQUEMENT quand un chauffeur vient de s'inscrire et n'a pas encore de proprietaireId.
+// Le chauffeur saisit le code à 6 chiffres que son propriétaire lui a communiqué.
+// Si le code est valide → proprietaireId est écrit dans Firestore → l'app passe en mode Authenticated.
+// Si le code est invalide → message d'erreur affiché, possibilité de réessayer.
+// Bouton "Se déconnecter" disponible si le chauffeur s'est trompé de compte.
+
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
@@ -11,10 +18,6 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 
-/**
- * Shown to a newly registered CHAUFFEUR who has not yet linked to a Propriétaire.
- * The chauffeur enters the 6-digit code their employer gave them.
- */
 @Composable
 fun LinkCodeScreen(
     viewModel: AuthViewModel,
@@ -26,6 +29,7 @@ fun LinkCodeScreen(
     val isLoading = linkState is AuthViewModel.LinkState.Loading
     val errorMsg  = (linkState as? AuthViewModel.LinkState.Error)?.message
 
+    // Efface l'erreur dès que l'utilisateur modifie le code
     LaunchedEffect(code) { if (code.isNotBlank()) viewModel.clearLinkState() }
 
     Column(
@@ -57,6 +61,7 @@ fun LinkCodeScreen(
 
         Spacer(Modifier.height(32.dp))
 
+        // Champ de saisie du code — accepte seulement 6 chiffres, pas d'autres caractères
         OutlinedTextField(
             value = code,
             onValueChange = { if (it.length <= 6 && it.all { c -> c.isDigit() }) code = it },
@@ -64,10 +69,11 @@ fun LinkCodeScreen(
             placeholder = { Text("ex: 482910") },
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             singleLine = true,
-            isError = errorMsg != null,
+            isError = errorMsg != null, // rouge si code invalide
             modifier = Modifier.fillMaxWidth()
         )
 
+        // Message d'erreur (code invalide ou erreur réseau)
         if (errorMsg != null) {
             Spacer(Modifier.height(4.dp))
             Text(
@@ -80,6 +86,7 @@ fun LinkCodeScreen(
 
         Spacer(Modifier.height(20.dp))
 
+        // Bouton Confirmer — actif uniquement quand le code a exactement 6 chiffres
         Button(
             onClick = { viewModel.linkToProprietaire(code) },
             enabled = code.length == 6 && !isLoading,
@@ -98,6 +105,7 @@ fun LinkCodeScreen(
 
         Spacer(Modifier.height(16.dp))
 
+        // Bouton de déconnexion — si le chauffeur s'est trompé de compte
         TextButton(onClick = { viewModel.signOut() }) {
             Text(
                 "Se déconnecter",

@@ -1,5 +1,11 @@
 package com.example.taxipilot.auth
 
+// Écran de connexion — premier écran affiché aux utilisateurs non connectés.
+// Champs : email + mot de passe (avec toggle visibilité).
+// Le bouton "Se connecter" est désactivé si les champs sont vides ou si un chargement est en cours.
+// Les erreurs (mauvais mot de passe, email invalide, etc.) s'affichent en rouge sous le formulaire.
+// LaunchedEffect(email, password) : efface l'erreur dès que l'utilisateur recommence à taper.
+
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
@@ -18,16 +24,16 @@ import androidx.compose.ui.unit.dp
 @Composable
 fun LoginScreen(
     viewModel: AuthViewModel,
-    onNavigateToRegister: () -> Unit
+    onNavigateToRegister: () -> Unit // callback pour aller sur l'écran d'inscription
 ) {
     val isLoading by viewModel.isLoading.collectAsState()
     val error by viewModel.error.collectAsState()
 
     var email by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
-    var passwordVisible by remember { mutableStateOf(false) }
+    var passwordVisible by remember { mutableStateOf(false) } // toggle affichage mot de passe
 
-    // Clear error when the user starts typing again
+    // Efface l'erreur automatiquement dès que l'utilisateur modifie email ou mot de passe
     LaunchedEffect(email, password) { viewModel.clearError() }
 
     Column(
@@ -37,6 +43,7 @@ fun LoginScreen(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
+        // Titre et sous-titre de l'app
         Text(
             text = "TaxiPilot",
             style = MaterialTheme.typography.headlineLarge,
@@ -51,6 +58,7 @@ fun LoginScreen(
 
         Spacer(Modifier.height(40.dp))
 
+        // Champ email
         OutlinedTextField(
             value = email,
             onValueChange = { email = it },
@@ -62,6 +70,7 @@ fun LoginScreen(
 
         Spacer(Modifier.height(12.dp))
 
+        // Champ mot de passe avec bouton œil pour afficher/masquer
         OutlinedTextField(
             value = password,
             onValueChange = { password = it },
@@ -84,6 +93,7 @@ fun LoginScreen(
 
         Spacer(Modifier.height(8.dp))
 
+        // Message d'erreur (mauvais mot de passe, email invalide, etc.)
         if (error != null) {
             Text(
                 text = error!!,
@@ -96,6 +106,7 @@ fun LoginScreen(
 
         Spacer(Modifier.height(8.dp))
 
+        // Bouton de connexion — désactivé si champs vides ou chargement en cours
         Button(
             onClick = { viewModel.signIn(email.trim(), password) },
             enabled = email.isNotBlank() && password.isNotBlank() && !isLoading,
@@ -120,6 +131,7 @@ fun LoginScreen(
 
         Spacer(Modifier.height(16.dp))
 
+        // Lien vers l'écran d'inscription pour les nouveaux utilisateurs
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
                 "Pas encore de compte ?",

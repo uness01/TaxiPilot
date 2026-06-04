@@ -1,5 +1,17 @@
 package com.example.taxipilot.auth
 
+// Écran de profil utilisateur — accessible depuis n'importe quel espace (Owner/Driver/Client).
+// Sections affichées :
+//   1. Badge de rôle (PROPRIETAIRE / CHAUFFEUR / CLIENT)
+//   2. Informations personnelles (nom, téléphone modifiables ; email en lecture seule)
+//   3. Section spécifique au rôle :
+//      - PROPRIETAIRE : affiche le code de partage à 6 chiffres
+//      - CHAUFFEUR    : taxi assigné, statut, informations de l'employeur
+//   4. Changement de mot de passe (section repliable)
+//
+// Les mises à jour de profil et de mot de passe utilisent ProfileUpdateState
+// (Idle → Loading → Success | Error) avec un Snackbar pour les retours utilisateur.
+
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
@@ -21,20 +33,22 @@ import androidx.compose.ui.unit.dp
 @Composable
 fun ProfileScreen(
     viewModel: AuthViewModel,
-    profile: UserProfile,
-    onBack: () -> Unit,
-    proprietaireInfo: FirestoreUser? = null
+    profile: UserProfile,              // profil de l'utilisateur connecté
+    onBack: () -> Unit,                // callback pour revenir à l'écran précédent
+    proprietaireInfo: FirestoreUser? = null // infos de l'employeur (chauffeurs seulement)
 ) {
     val updateState by viewModel.profileUpdateState.collectAsState()
 
+    // États locaux pré-remplis avec les valeurs actuelles du profil
     var nom        by remember(profile.nom) { mutableStateOf(profile.nom) }
     var telephone  by remember(profile.telephone) { mutableStateOf(profile.telephone) }
     var newPassword by remember { mutableStateOf("") }
     var confirmPassword by remember { mutableStateOf("") }
 
-    var showPasswordSection by remember { mutableStateOf(false) }
-    var snackMessage by remember { mutableStateOf<String?>(null) }
+    var showPasswordSection by remember { mutableStateOf(false) } // section MDP repliée par défaut
+    var snackMessage by remember { mutableStateOf<String?>(null) } // message Snackbar
 
+    // Réagit aux résultats de mise à jour (succès → Snackbar vert, erreur → Snackbar rouge)
     LaunchedEffect(updateState) {
         when (val s = updateState) {
             is AuthViewModel.ProfileUpdateState.Success -> {
@@ -89,7 +103,7 @@ fun ProfileScreen(
         ) {
             Spacer(Modifier.height(8.dp))
 
-            // ── Role badge ────────────────────────────────────────────────────
+            // Badge indiquant le rôle de l'utilisateur
             Surface(
                 shape = MaterialTheme.shapes.small,
                 color = MaterialTheme.colorScheme.secondaryContainer
@@ -102,7 +116,7 @@ fun ProfileScreen(
                 )
             }
 
-            // ── Basic info ────────────────────────────────────────────────────
+            // ── Section informations personnelles ─────────────────────────────
             Card {
                 Column(
                     modifier = Modifier.padding(16.dp),
@@ -126,6 +140,7 @@ fun ProfileScreen(
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
                         modifier = Modifier.fillMaxWidth()
                     )
+                    // Email en lecture seule (non modifiable via Firebase Basic Auth sans re-auth)
                     OutlinedTextField(
                         value = profile.email,
                         onValueChange = {},
@@ -149,9 +164,10 @@ fun ProfileScreen(
                 }
             }
 
-            // ── Role-specific info (read-only) ────────────────────────────────
+            // ── Section spécifique au rôle ────────────────────────────────────
             when (profile.role) {
                 UserRole.PROPRIETAIRE -> {
+                    // Propriétaire : affiche le code de partage (non modifiable ici)
                     Card {
                         Column(
                             modifier = Modifier.padding(16.dp),
@@ -182,6 +198,7 @@ fun ProfileScreen(
                     }
                 }
                 UserRole.CHAUFFEUR -> {
+                    // Chauffeur : taxi assigné et statut de service
                     Card {
                         Column(
                             modifier = Modifier.padding(16.dp),
@@ -207,7 +224,7 @@ fun ProfileScreen(
                         }
                     }
 
-                    // ── Mon Employeur ─────────────────────────────────────────
+                    // Informations de l'employeur (chargées depuis Firestore)
                     Card {
                         Column(
                             modifier = Modifier.padding(16.dp),
@@ -223,10 +240,7 @@ fun ProfileScreen(
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             } else if (proprietaireInfo == null) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(20.dp),
-                                    strokeWidth = 2.dp
-                                )
+                                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
                             } else {
                                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                                     Text("👤 Nom :", style = MaterialTheme.typography.bodySmall)
@@ -251,10 +265,10 @@ fun ProfileScreen(
                         }
                     }
                 }
-                UserRole.CLIENT -> Unit
+                UserRole.CLIENT -> Unit // pas de section spécifique pour les clients
             }
 
-            // ── Change password ───────────────────────────────────────────────
+            // ── Section changement de mot de passe (repliable) ───────────────
             Card {
                 Column(
                     modifier = Modifier.padding(16.dp),

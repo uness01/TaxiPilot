@@ -1,5 +1,15 @@
 package com.example.taxipilot.core.data.maps
 
+// Repository pour le géocodage via l'API OpenStreetMap Nominatim.
+// Deux opérations :
+//   - search()   : géocodage direct (texte libre → liste de lieux avec coordonnées GPS)
+//   - reverse()  : géocodage inverse (coordonnées GPS → adresse lisible "Rue, Ville")
+//
+// Règles d'utilisation de Nominatim :
+//   - Max 1 requête/seconde → le debounce doit être géré dans la couche UI
+//   - Identifier l'app avec un User-Agent valide ("TaxiPilotApp/1.0")
+//   - Ne pas utiliser pour du trafic très élevé (préférer héberger sa propre instance)
+
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -11,19 +21,17 @@ import java.net.URLEncoder
 
 private const val TAG = "Nominatim"
 
+// Résultat d'une recherche Nominatim : coordonnées + nom affiché
 data class NominatimResult(
-    val lat: Double,
-    val lon: Double,
-    val displayName: String
+    val lat: Double,           // latitude du lieu
+    val lon: Double,           // longitude du lieu
+    val displayName: String    // nom complet retourné par Nominatim
 ) {
-    /**
-     * Returns "Street/Neighbourhood, City" — at most 40 chars.
-     * Skips postal codes, country names, and French/Arabic admin divisions
-     * (arrondissement, préfecture, région, wilaya…).
-     */
+    // Retourne un nom court "Rue, Ville" (max 40 caractères) en filtrant les divisions administratives
     fun shortName(): String = formatShortAddress(displayName)
 }
 
+// Mots à ignorer pour construire le nom court (divisions administratives Maroc/Maghreb)
 private val SKIP_WORDS = listOf(
     "arrondissement", "arrondissements",
     "préfecture", "prefecture",
@@ -33,7 +41,8 @@ private val SKIP_WORDS = listOf(
     "mauritanie", "mauritania"
 )
 
-/** Shared address formatter used by NominatimResult and reverse geocoding. */
+// Formatte une adresse complète en version courte "Rue, Ville" (max 40 caractères)
+// Utilisé par NominatimResult.shortName() et le géocodage inverse
 internal fun formatShortAddress(displayName: String): String {
     val parts = displayName.split(",")
         .map { it.trim() }
@@ -41,7 +50,7 @@ internal fun formatShortAddress(displayName: String): String {
 
     val street = parts.firstOrNull() ?: return displayName.take(40)
 
-    // City: first part after the street that is not a postal code and not an admin division
+    // Ville : premier segment après la rue qui n'est ni un code postal ni une division admin
     val city = parts.drop(1).firstOrNull { part ->
         val lower = part.lowercase()
         !lower.all { c -> c.isDigit() || c == ' ' } &&
@@ -52,16 +61,10 @@ internal fun formatShortAddress(displayName: String): String {
     return if (result.length > 40) result.take(37) + "…" else result
 }
 
-/**
- * OpenStreetMap Nominatim geocoding.
- *
- * Usage policy: https://operations.osmfoundation.org/policies/nominatim/
- * — Identify app with a valid User-Agent.
- * — Max 1 request / second (debounce searches in the UI layer).
- */
 class NominatimRepository {
 
-    /** Forward geocoding: free-text query → list of matching locations. */
+    // Géocodage direct : texte libre → liste de résultats avec coordonnées GPS
+    // Utilisé dans les champs de saisie d'adresse (départ et arrivée) avec autocomplétion
     suspend fun search(query: String, limit: Int = 5): List<NominatimResult> =
         withContext(Dispatchers.IO) {
             if (query.isBlank()) return@withContext emptyList()
@@ -72,7 +75,7 @@ class NominatimRepository {
                     "?q=$encoded&format=json&limit=$limit&addressdetails=0"
                 )
                 val conn = (url.openConnection() as HttpURLConnection).apply {
-                    setRequestProperty("User-Agent", "TaxiPilotApp/1.0")
+                    setRequestProperty("User-Agent", "TaxiPilotApp/1.0") // obligatoire selon Nominatim
                     connectTimeout = 10_000
                     readTimeout    = 10_000
                 }
@@ -92,7 +95,8 @@ class NominatimRepository {
             }
         }
 
-    /** Reverse geocoding: coordinates → short human-readable address ("Street, City"). */
+    // Géocodage inverse : coordonnées GPS → adresse courte lisible ("Rue, Ville")
+    // Utilisé pour afficher l'adresse au relâchement du marker sur la carte OSMDroid
     suspend fun reverse(lat: Double, lon: Double): String =
         withContext(Dispatchers.IO) {
             runCatching {
@@ -109,13 +113,13 @@ class NominatimRepository {
                 val json = JSONObject(body)
                 val addr = json.optJSONObject("address")
                 if (addr != null) {
-                    // Street-level label: prefer road, then neighbourhood, then suburb
+                    // Rue : préfère "road", sinon "neighbourhood", sinon "suburb"
                     val street = addr.optString("road").ifBlank {
                         addr.optString("neighbourhood").ifBlank {
                             addr.optString("suburb").ifBlank { "" }
                         }
                     }
-                    // City-level label: prefer city, then town, then village, then county
+                    // Ville : préfère "city", sinon "town", sinon "village", sinon "county"
                     val city = addr.optString("city").ifBlank {
                         addr.optString("town").ifBlank {
                             addr.optString("village").ifBlank {
@@ -137,6 +141,6 @@ class NominatimRepository {
                         json.optString("display_name").ifBlank { "$lat, $lon" }
                     )
                 }
-            }.getOrElse { "$lat, $lon" }
+            }.getOrElse { "$lat, $lon" } // fallback : affiche les coordonnées brutes si erreur
         }
 }

@@ -1,5 +1,10 @@
 package com.example.taxipilot.navigation
 
+// Écran d'accueil de sélection de l'espace — non utilisé dans le flux Firebase actuel
+// (TaxiPilotNavHost redirige directement vers l'espace du rôle de l'utilisateur connecté).
+// Conservé comme écran de fallback ou pour des tests sans authentification.
+// Affiche trois boutons permettant de choisir manuellement Propriétaire / Chauffeur / Client.
+
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
@@ -9,9 +14,9 @@ import androidx.compose.ui.unit.dp
 
 @Composable
 fun HomeScreen(
-    onNavigateToOwner: () -> Unit,
-    onNavigateToDriver: () -> Unit,
-    onNavigateToClient: () -> Unit
+    onNavigateToOwner: () -> Unit,  // navigue vers l'espace propriétaire
+    onNavigateToDriver: () -> Unit, // navigue vers l'espace chauffeur
+    onNavigateToClient: () -> Unit  // navigue vers l'espace client
 ) {
     Scaffold { padding ->
         Column(
@@ -34,6 +39,7 @@ fun HomeScreen(
             )
             Spacer(Modifier.height(48.dp))
 
+            // Boutons de navigation vers chaque espace
             SpaceButton(label = "Propriétaire", onClick = onNavigateToOwner)
             Spacer(Modifier.height(16.dp))
             SpaceButton(label = "Chauffeur", onClick = onNavigateToDriver)
@@ -43,6 +49,7 @@ fun HomeScreen(
     }
 }
 
+// Bouton pleine largeur pour la sélection de l'espace utilisateur
 @Composable
 private fun SpaceButton(label: String, onClick: () -> Unit) {
     Button(

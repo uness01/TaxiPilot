@@ -1,5 +1,17 @@
 package com.example.taxipilot
 
+// Service FCM (Firebase Cloud Messaging) — reçoit les notifications push.
+// Deux cas d'utilisation :
+//   1. onNewToken() : appelé quand le token FCM change (premier lancement / rotation de token)
+//      → enregistre le nouveau token dans Firestore pour que l'app puisse recevoir des pushes
+//   2. onMessageReceived() : appelé quand un message FCM arrive en PREMIER PLAN
+//      → affiche manuellement une notification Android
+//      (en arrière-plan/tué, FCM affiche automatiquement la partie "notification" du payload)
+//
+// Déduplication : le notifId est basé sur le notif_doc_id Firestore partagé avec
+// NotificationListenerService → un seul bandeau Android par alerte même si les deux services
+// reçoivent le message quasi simultanément.
+
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
@@ -14,13 +26,12 @@ import kotlinx.coroutines.launch
 
 class TaxiPilotMessagingService : FirebaseMessagingService() {
 
+    // Scope de coroutine lié au cycle de vie du service
     private val serviceJob   = SupervisorJob()
     private val serviceScope = CoroutineScope(Dispatchers.IO + serviceJob)
 
-    /**
-     * Called when the FCM token is refreshed (rare — first install / token rotation).
-     * Save it to Firestore so other devices can reach this one.
-     */
+    // Appelé quand le token FCM est renouvelé (rare : premier install ou rotation forcée).
+    // On met à jour le token dans Firestore pour que les futures notifications push arrivent.
     override fun onNewToken(token: String) {
         val uid = AuthRepository().currentUser?.uid ?: return
         serviceScope.launch {
@@ -28,19 +39,10 @@ class TaxiPilotMessagingService : FirebaseMessagingService() {
         }
     }
 
-    /**
-     * Called when a message arrives while the app is in the FOREGROUND.
-     * For background/killed state, FCM automatically shows the "notification" payload
-     * — no code needed for that case.
-     */
-    /**
-     * Called when FCM message arrives while app is in the FOREGROUND.
-     * (Background/killed → system shows the `notification` payload automatically.)
-     *
-     * Uses [notifDocId] as the Android notification ID so that a duplicate
-     * from [NotificationListenerService] (Firestore listener) overwrites this
-     * one instead of stacking.
-     */
+    // Appelé quand un message FCM arrive pendant que l'app est en PREMIER PLAN.
+    // (En arrière-plan ou tué → FCM affiche automatiquement la partie "notification" du payload)
+    // Le notifId est dérivé du notif_doc_id Firestore → même ID que NotificationListenerService
+    // → si les deux arrivent presque en même temps, le deuxième écrase le premier (pas de doublons).
     override fun onMessageReceived(message: RemoteMessage) {
         val title = message.data["title"]
             ?: message.notification?.title
@@ -50,12 +52,14 @@ class TaxiPilotMessagingService : FirebaseMessagingService() {
             ?: message.data.let { d -> "${d["depart"]} → ${d["arrivee"]}" }.trim(' ', '→', ' ')
 
         val reservationId = message.data["reservationId"]
-        // Shared ID with NotificationListenerService — prevents duplicate banner
+        // ID partagé avec NotificationListenerService pour dédupliquer les bandeaux
         val notifId = message.data["notif_doc_id"]?.hashCode()
             ?: System.currentTimeMillis().toInt()
         showForegroundNotification(title, body, notifId, reservationId)
     }
 
+    // Affiche une notification Android avec un Intent qui ouvre MainActivity en tapant dessus
+    // Si reservationId est présent, l'activité s'ouvre directement sur la réservation concernée
     private fun showForegroundNotification(
         title: String,
         body: String,
@@ -64,6 +68,7 @@ class TaxiPilotMessagingService : FirebaseMessagingService() {
     ) {
         val manager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
 
+        // Intent qui ouvre MainActivity et passe l'ID de réservation si disponible
         val intent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
             if (reservationId != null) putExtra(MainActivity.EXTRA_RESERVATION_ID, reservationId)
@@ -77,17 +82,17 @@ class TaxiPilotMessagingService : FirebaseMessagingService() {
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentTitle(title)
             .setContentText(body)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
-            .setAutoCancel(true)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(body)) // texte extensible
+            .setAutoCancel(true)   // disparaît quand l'utilisateur tape dessus
             .setContentIntent(pendingIntent)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setPriority(NotificationCompat.PRIORITY_HIGH) // bandeau heads-up
             .build()
 
         manager.notify(notifId, notification)
     }
 
     override fun onDestroy() {
-        serviceJob.cancel()
+        serviceJob.cancel() // annule toutes les coroutines en cours
         super.onDestroy()
     }
 }

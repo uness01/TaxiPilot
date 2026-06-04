@@ -1,5 +1,15 @@
 package com.example.taxipilot.core.data.repository
 
+// Repository Firestore pour les utilisateurs (chauffeurs et propriétaires).
+// Gère :
+//   - Le liage chauffeur ↔ propriétaire (via le code à 6 chiffres)
+//   - La liste en temps réel des chauffeurs d'un propriétaire
+//   - L'assignation/désassignation de taxi
+//   - La position GPS temps réel du chauffeur pendant une course
+//   - Le statut de service (en_service / hors_service / en_course)
+//   - Les tokens FCM pour l'envoi de notifications push
+//   - La génération et régénération du code propriétaire
+
 import android.util.Log
 import com.example.taxipilot.core.data.firestore.FirestoreUser
 import com.google.firebase.firestore.DocumentSnapshot
@@ -15,13 +25,11 @@ private const val TAG = "FirestoreUsers"
 class FirestoreUserRepository {
 
     private val db    = FirebaseFirestore.getInstance()
-    private val users = db.collection("users")
+    private val users = db.collection("users") // collection Firestore des utilisateurs
 
-    // ── Chauffeur linking ─────────────────────────────────────────────────────
+    // ── Liage chauffeur ↔ propriétaire ────────────────────────────────────────
 
-    /**
-     * Returns the proprietaire whose codeProprietaire matches [code], or null.
-     */
+    // Cherche le propriétaire dont le codeProprietaire correspond à [code] (retourne null si absent)
     suspend fun getProprietaireByCode(code: String): FirestoreUser? = runCatching {
         val query = users
             .whereEqualTo("codeProprietaire", code)
@@ -34,9 +42,7 @@ class FirestoreUserRepository {
         null
     }
 
-    /**
-     * Sets [proprietaireId] on the chauffeur's Firestore user document.
-     */
+    // Inscrit un chauffeur sous un propriétaire (écrit proprietaireId dans son document Firestore)
     suspend fun linkChauffeurToProprietaire(chauffeurUid: String, proprietaireId: String) {
         runCatching {
             users.document(chauffeurUid)
@@ -44,17 +50,14 @@ class FirestoreUserRepository {
         }.onFailure { Log.w(TAG, "linkChauffeur error: ${it.message}") }
     }
 
-    // ── Real-time fleet flows ─────────────────────────────────────────────────
+    // ── Flux temps réel (flotte) ──────────────────────────────────────────────
 
-    /**
-     * Live list of all users linked to [proprietaireId].
-     * Uses a single-field query (no composite index needed).
-     * Only chauffeurs ever have proprietaireId set, so the role filter is redundant.
-     */
+    // Liste en temps réel de tous les chauffeurs liés à un propriétaire.
+    // Requête sur un seul champ → pas besoin d'index composite Firestore.
     fun getChauffeursByProprietaire(proprietaireId: String): Flow<List<FirestoreUser>> =
         callbackFlow {
             val reg = users
-                .whereEqualTo("proprietaireId", proprietaireId)   // single-field — no index required
+                .whereEqualTo("proprietaireId", proprietaireId)
                 .addSnapshotListener { snap, err ->
                     if (err != null) {
                         Log.e(TAG, "Fleet listener error: ${err.code} — ${err.message}")
@@ -69,17 +72,14 @@ class FirestoreUserRepository {
             emit(emptyList())
         }
 
-    /**
-     * Returns the existing [codeProprietaire] for [uid].
-     * If the field is missing (old account), generates a unique 6-digit code,
-     * saves it to Firestore, and returns it.
-     */
+    // Retourne le code existant du propriétaire, ou en génère un nouveau unique (6 chiffres)
+    // si le champ est absent (comptes anciens sans code).
     suspend fun getOrGenerateProprietaireCode(uid: String): String? = runCatching {
         val doc = users.document(uid).get().await()
         val existing = doc.getString("codeProprietaire")
         if (!existing.isNullOrBlank()) return@runCatching existing
 
-        // No code yet — generate a unique one
+        // Génère un code unique en vérifiant les conflits dans Firestore
         var code: String
         do {
             code = (100000..999999).random().toString()
@@ -95,21 +95,21 @@ class FirestoreUserRepository {
 
     // ── Mutations ─────────────────────────────────────────────────────────────
 
-    /** Owner assigns a taxi (by matricule) to a chauffeur. */
+    // Propriétaire assigne un taxi (par matricule) à un chauffeur
     suspend fun assignTaxiToChauffeur(chauffeurUid: String, taxiMatricule: String) {
         runCatching {
             users.document(chauffeurUid).update("assignedTaxi", taxiMatricule).await()
         }.onFailure { Log.w(TAG, "assignTaxi error: ${it.message}") }
     }
 
-    /** Remove taxi assignment from a chauffeur. */
+    // Propriétaire retire le taxi d'un chauffeur (assignedTaxi → null)
     suspend fun unassignTaxi(chauffeurUid: String) {
         runCatching {
             users.document(chauffeurUid).update("assignedTaxi", null).await()
         }.onFailure { Log.w(TAG, "unassignTaxi error: ${it.message}") }
     }
 
-    /** Write chauffeur's current GPS position (called every ~15 s while en_course). */
+    // Met à jour la position GPS du chauffeur (appelé toutes les ~15 s pendant une course)
     suspend fun updateCurrentLocation(uid: String, lat: Double, lng: Double) {
         runCatching {
             users.document(uid).update(
@@ -118,7 +118,7 @@ class FirestoreUserRepository {
         }.onFailure { Log.w(TAG, "updateCurrentLocation error: ${it.message}") }
     }
 
-    /** Clear GPS position when course ends. */
+    // Efface la position GPS à la fin de la course (currentLat/Lng → null)
     suspend fun clearCurrentLocation(uid: String) {
         runCatching {
             users.document(uid).update(
@@ -127,7 +127,7 @@ class FirestoreUserRepository {
         }.onFailure { Log.w(TAG, "clearCurrentLocation error: ${it.message}") }
     }
 
-    /** Fetch the current statut string for a single user (one-shot). */
+    // One-shot : lit le statut actuel d'un utilisateur (retourne null si erreur réseau)
     suspend fun getStatut(uid: String): String? = runCatching {
         users.document(uid).get().await().getString("statut")
     }.getOrElse {
@@ -135,7 +135,8 @@ class FirestoreUserRepository {
         null
     }
 
-    /** Real-time statut stream for a single user via snapshot listener. */
+    // Flux temps réel du statut d'un utilisateur (snapshot listener → Flow)
+    // Utilisé par DriverViewModel pour rester synchronisé avec Firestore après toggleStatut()
     fun observeStatut(uid: String): Flow<String> = callbackFlow {
         val reg = users.document(uid).addSnapshotListener { snap, err ->
             if (err != null) {
@@ -148,7 +149,7 @@ class FirestoreUserRepository {
         awaitClose { reg.remove() }
     }.catch { e -> Log.e(TAG, "observeStatut flow error: ${e.message}") }
 
-    /** One-shot fetch of any user document by UID (used to load proprietaire info). */
+    // One-shot : récupère un profil utilisateur complet par son UID (ex : infos du propriétaire)
     suspend fun getUser(uid: String): FirestoreUser? = runCatching {
         users.document(uid).get().await().toFirestoreUser()
     }.getOrElse {
@@ -156,11 +157,8 @@ class FirestoreUserRepository {
         null
     }
 
-    /**
-     * Generate a new unique 6-character alphanumeric code, save it on the proprietaire's
-     * document, and return it.  The old code becomes invalid for new registrations;
-     * already-linked chauffeurs are NOT affected.
-     */
+    // Génère un nouveau code alphanumériquer unique (6 caractères) et le sauvegarde.
+    // Les chauffeurs déjà liés ne sont PAS affectés — seuls les nouveaux liages utilisent le nouveau code.
     suspend fun regenerateProprietaireCode(uid: String): String? = runCatching {
         val chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
         var code: String
@@ -175,14 +173,14 @@ class FirestoreUserRepository {
         null
     }
 
-    /** Update chauffeur statut (disponible / en_course). */
+    // Met à jour le statut de service d'un chauffeur (en_service / hors_service / en_course)
     suspend fun updateStatut(userUid: String, statut: String) {
         runCatching {
             users.document(userUid).update("statut", statut).await()
         }.onFailure { Log.w(TAG, "updateStatut error: ${it.message}") }
     }
 
-    /** Fetch FCM tokens for all CHAUFFEUR users. */
+    // Récupère les tokens FCM de TOUS les chauffeurs (pour broadcast de notifications)
     suspend fun getAllChauffeurFcmTokens(): List<String> = runCatching {
         val snap = users.whereEqualTo("role", FirestoreUser.ROLE_CHAUFFEUR).get().await()
         snap.documents.mapNotNull { it.getString("fcmToken") }.filter { it.isNotBlank() }
@@ -191,7 +189,7 @@ class FirestoreUserRepository {
         emptyList()
     }
 
-    /** Fetch FCM tokens only for chauffeurs who are en_service (available for new reservations). */
+    // Récupère les tokens FCM uniquement des chauffeurs en_service (disponibles pour de nouvelles courses)
     suspend fun getActiveChauffeurFcmTokens(): List<String> = runCatching {
         val snap = users
             .whereEqualTo("role", FirestoreUser.ROLE_CHAUFFEUR)
@@ -203,8 +201,9 @@ class FirestoreUserRepository {
         emptyList()
     }
 
-    // ── Deserialization ───────────────────────────────────────────────────────
+    // ── Désérialisation ───────────────────────────────────────────────────────
 
+    // Convertit un DocumentSnapshot en FirestoreUser (retourne null si invalide)
     private fun DocumentSnapshot.toFirestoreUser(): FirestoreUser? = runCatching {
         FirestoreUser(
             uid              = getString("uid")              ?: id,

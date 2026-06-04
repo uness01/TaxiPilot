@@ -1,5 +1,11 @@
 package com.example.taxipilot.auth
 
+// Écran d'inscription — permet de créer un nouveau compte Firebase.
+// Champs : nom complet, email, mot de passe (toggle visibilité), téléphone.
+// Sélection du rôle via des boutons segmentés (Propriétaire / Chauffeur / Client).
+// Défilement vertical activé (verticalScroll) pour les petits écrans.
+// Le bouton "Créer mon compte" est désactivé si un champ est vide ou si chargement en cours.
+
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
@@ -20,7 +26,7 @@ import androidx.compose.ui.unit.dp
 @Composable
 fun RegisterScreen(
     viewModel: AuthViewModel,
-    onNavigateToLogin: () -> Unit
+    onNavigateToLogin: () -> Unit // callback pour retourner à l'écran de connexion
 ) {
     val isLoading by viewModel.isLoading.collectAsState()
     val error by viewModel.error.collectAsState()
@@ -29,15 +35,16 @@ fun RegisterScreen(
     var email by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     var telephone by remember { mutableStateOf("") }
-    var selectedRole by remember { mutableStateOf(UserRole.CLIENT) }
+    var selectedRole by remember { mutableStateOf(UserRole.CLIENT) } // rôle par défaut
     var passwordVisible by remember { mutableStateOf(false) }
 
+    // Efface l'erreur dès que l'utilisateur modifie un champ
     LaunchedEffect(nom, email, password, telephone) { viewModel.clearError() }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .verticalScroll(rememberScrollState())
+            .verticalScroll(rememberScrollState()) // défilement pour petits écrans
             .padding(horizontal = 32.dp, vertical = 24.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
@@ -50,6 +57,7 @@ fun RegisterScreen(
 
         Spacer(Modifier.height(32.dp))
 
+        // Champ nom complet
         OutlinedTextField(
             value = nom,
             onValueChange = { nom = it },
@@ -60,6 +68,7 @@ fun RegisterScreen(
 
         Spacer(Modifier.height(12.dp))
 
+        // Champ email
         OutlinedTextField(
             value = email,
             onValueChange = { email = it },
@@ -71,6 +80,7 @@ fun RegisterScreen(
 
         Spacer(Modifier.height(12.dp))
 
+        // Champ mot de passe avec toggle visibilité
         OutlinedTextField(
             value = password,
             onValueChange = { password = it },
@@ -93,6 +103,7 @@ fun RegisterScreen(
 
         Spacer(Modifier.height(12.dp))
 
+        // Champ téléphone (clavier numérique)
         OutlinedTextField(
             value = telephone,
             onValueChange = { telephone = it },
@@ -112,6 +123,7 @@ fun RegisterScreen(
 
         Spacer(Modifier.height(8.dp))
 
+        // Sélecteur de rôle — boutons segmentés (choix unique : Propriétaire / Chauffeur / Client)
         SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
             UserRole.entries.forEachIndexed { index, role ->
                 SegmentedButton(
@@ -125,6 +137,7 @@ fun RegisterScreen(
 
         Spacer(Modifier.height(20.dp))
 
+        // Message d'erreur (email déjà utilisé, mot de passe trop court, etc.)
         if (error != null) {
             Text(
                 text = error!!,
@@ -135,6 +148,7 @@ fun RegisterScreen(
             Spacer(Modifier.height(4.dp))
         }
 
+        // Bouton de création de compte — désactivé si champs vides ou chargement
         Button(
             onClick = {
                 viewModel.register(
@@ -168,6 +182,7 @@ fun RegisterScreen(
 
         Spacer(Modifier.height(12.dp))
 
+        // Lien de retour vers l'écran de connexion
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("Déjà un compte ?", style = MaterialTheme.typography.bodyMedium)
             TextButton(onClick = onNavigateToLogin) {

@@ -1,5 +1,21 @@
 package com.example.taxipilot.auth
 
+// ViewModel d'authentification — fait le pont entre AuthRepository et les écrans UI.
+// Gère trois machines à états :
+//
+//   AuthState : état global de connexion
+//     Loading → (vérif Firebase) → Unauthenticated | NeedsProprietaireLink | Authenticated
+//
+//   LinkState : état du liage chauffeur ↔ propriétaire
+//     Idle → Loading → Success | Error
+//
+//   ProfileUpdateState : état de la mise à jour du profil
+//     Idle → Loading → Success | Error
+//
+// Cas spécial NeedsProprietaireLink : un chauffeur venant de s'inscrire n'a pas encore
+// de proprietaireId → il est bloqué sur LinkCodeScreen jusqu'à saisir le bon code.
+// resolveState() détermine si le profil doit aller vers NeedsProprietaireLink ou Authenticated.
+
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -12,14 +28,16 @@ import kotlinx.coroutines.tasks.await
 
 class AuthViewModel(private val authRepository: AuthRepository) : ViewModel() {
 
+    // ── Machine à états d'authentification ───────────────────────────────────
     sealed class AuthState {
-        data object Loading : AuthState()
-        data object Unauthenticated : AuthState()
-        /** Chauffeur registered but not yet linked to a proprietaire. */
+        data object Loading : AuthState()           // vérification de la session en cours
+        data object Unauthenticated : AuthState()   // pas de session active
+        // Chauffeur inscrit mais pas encore lié à un propriétaire (bloqué sur LinkCodeScreen)
         data class NeedsProprietaireLink(val profile: UserProfile) : AuthState()
-        data class Authenticated(val profile: UserProfile) : AuthState()
+        data class Authenticated(val profile: UserProfile) : AuthState() // connecté et prêt
     }
 
+    // ── Machine à états de liage propriétaire ─────────────────────────────────
     sealed class LinkState {
         data object Idle    : LinkState()
         data object Loading : LinkState()
@@ -40,6 +58,7 @@ class AuthViewModel(private val authRepository: AuthRepository) : ViewModel() {
     val linkState: StateFlow<LinkState> = _linkState.asStateFlow()
 
     init {
+        // Observe l'état Firebase Auth en temps réel — se déclenche à chaque connexion/déconnexion
         viewModelScope.launch {
             authRepository.authStateFlow().collect { firebaseUser ->
                 if (firebaseUser == null) {
@@ -49,7 +68,7 @@ class AuthViewModel(private val authRepository: AuthRepository) : ViewModel() {
                     if (profile != null) {
                         _authState.value = resolveState(profile)
                     } else {
-                        // Firebase auth exists but no Firestore profile — force sign-out
+                        // Firebase Auth existe mais pas de document Firestore → déconnexion forcée
                         authRepository.signOut()
                     }
                 }
@@ -57,12 +76,14 @@ class AuthViewModel(private val authRepository: AuthRepository) : ViewModel() {
         }
     }
 
+    // Détermine l'état après connexion : chauffeur sans propriétaire → NeedsProprietaireLink
     private fun resolveState(profile: UserProfile): AuthState =
         if (profile.role == UserRole.CHAUFFEUR && profile.proprietaireId == null)
             AuthState.NeedsProprietaireLink(profile)
         else
             AuthState.Authenticated(profile)
 
+    // Connecte un utilisateur existant → si succès, sauvegarde le token FCM
     fun signIn(email: String, password: String) {
         viewModelScope.launch {
             _isLoading.value = true
@@ -74,6 +95,7 @@ class AuthViewModel(private val authRepository: AuthRepository) : ViewModel() {
         }
     }
 
+    // Crée un nouveau compte et le profil Firestore → si succès, sauvegarde le token FCM
     fun register(
         email: String,
         password: String,
@@ -91,7 +113,7 @@ class AuthViewModel(private val authRepository: AuthRepository) : ViewModel() {
         }
     }
 
-    /** Chauffeur enters their proprietaire's 6-digit code to link accounts. */
+    // Chauffeur entre le code à 6 chiffres de son propriétaire pour lier les deux comptes
     fun linkToProprietaire(code: String) {
         val profile = (_authState.value as? AuthState.NeedsProprietaireLink)?.profile ?: return
         viewModelScope.launch {
@@ -103,8 +125,8 @@ class AuthViewModel(private val authRepository: AuthRepository) : ViewModel() {
             }
             try {
                 authRepository.linkChauffeurToProprietaire(profile.uid, proprietaire.uid)
-                // authStateFlow only fires on sign-in/out, not Firestore changes —
-                // manually reload the profile so the state transitions immediately.
+                // authStateFlow ne se redéclenche pas sur les changements Firestore seuls
+                // → on recharge manuellement le profil pour déclencher la transition d'état
                 val updated = authRepository.getUserProfile(profile.uid)
                 if (updated != null) _authState.value = resolveState(updated)
                 _linkState.value = LinkState.Success
@@ -114,9 +136,10 @@ class AuthViewModel(private val authRepository: AuthRepository) : ViewModel() {
         }
     }
 
+    // Remet l'état de liage à Idle (après affichage d'une erreur ou d'un succès)
     fun clearLinkState() { _linkState.value = LinkState.Idle }
 
-    // ── Profile update ────────────────────────────────────────────────────────
+    // ── Mise à jour du profil ─────────────────────────────────────────────────
 
     sealed class ProfileUpdateState {
         data object Idle    : ProfileUpdateState()
@@ -128,6 +151,7 @@ class AuthViewModel(private val authRepository: AuthRepository) : ViewModel() {
     private val _profileUpdateState = MutableStateFlow<ProfileUpdateState>(ProfileUpdateState.Idle)
     val profileUpdateState: StateFlow<ProfileUpdateState> = _profileUpdateState.asStateFlow()
 
+    // Met à jour nom et téléphone dans Firestore
     fun updateProfile(nom: String, telephone: String) {
         val uid = authRepository.currentUser?.uid ?: return
         viewModelScope.launch {
@@ -138,6 +162,7 @@ class AuthViewModel(private val authRepository: AuthRepository) : ViewModel() {
         }
     }
 
+    // Change le mot de passe Firebase Auth
     fun updatePassword(newPassword: String) {
         viewModelScope.launch {
             _profileUpdateState.value = ProfileUpdateState.Loading
@@ -149,14 +174,16 @@ class AuthViewModel(private val authRepository: AuthRepository) : ViewModel() {
 
     fun clearProfileUpdateState() { _profileUpdateState.value = ProfileUpdateState.Idle }
 
+    // Déconnecte l'utilisateur → authStateFlow émet null → NavHost revient sur LoginScreen
     fun signOut() {
         authRepository.signOut()
     }
 
     fun clearError() { _error.value = null }
 
-    // ── FCM token ─────────────────────────────────────────────────────────────
+    // ── Token FCM ─────────────────────────────────────────────────────────────
 
+    // Lit le token FCM actuel et le sauvegarde dans Firestore (appelé après connexion/inscription)
     private fun saveFcmToken(uid: String) {
         viewModelScope.launch {
             runCatching {
@@ -166,6 +193,7 @@ class AuthViewModel(private val authRepository: AuthRepository) : ViewModel() {
         }
     }
 
+    // Factory manuelle pour créer le ViewModel avec son AuthRepository (pas de Hilt)
     class Factory(private val authRepository: AuthRepository) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(modelClass: Class<T>): T =

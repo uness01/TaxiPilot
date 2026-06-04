@@ -1,5 +1,22 @@
 package com.example.taxipilot.notification
 
+// Service foreground — maintient un listener Firestore actif en arrière-plan pour les chauffeurs.
+// Rôle : afficher une notification Android dès qu'une nouvelle course apparaît dans Firestore,
+// même quand l'app est en arrière-plan ou que l'écran est éteint.
+//
+// Architecture :
+//   - START_STICKY : redémarré automatiquement par Android si tué par le système
+//   - serviceStartTime : ignore les documents Firestore créés AVANT le démarrage du service
+//     (évite de ré-alerter pour l'historique existant au premier snapshot)
+//   - Notification foreground silencieuse (CHANNEL_SERVICE) requise depuis Android O
+//
+// Déduplication avec TaxiPilotMessagingService :
+//   Les deux services utilisent change.document.id.hashCode() comme notifId.
+//   → Si FCM et Firestore arrivent en même temps, le deuxième écrase le premier (pas de doublon).
+//
+// Cycle de vie contrôlé depuis TaxiPilotNavHost :
+//   Chauffeur passe hors_service → stop() | Chauffeur se déconnecte → stop() (DisposableEffect)
+
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
@@ -17,33 +34,24 @@ import com.google.firebase.firestore.ListenerRegistration
 
 private const val TAG = "NotifListenerService"
 
-/**
- * Foreground service that maintains a real-time Firestore listener on the
- * "notifications" collection.  When a new document targeting CHAUFFEUR role
- * appears (created after this service started), it fires a local Android
- * notification so the chauffeur sees the alert even if the app is in the
- * background or the screen is off.
- *
- * The service runs as long as the chauffeur is logged in.  Start/stop is
- * driven by TaxiPilotNavHost via DisposableEffect.
- */
 class NotificationListenerService : Service() {
 
     private val db = FirebaseFirestore.getInstance()
     private var firestoreReg: ListenerRegistration? = null
 
-    // Only show notifications created AFTER this service instance started —
-    // prevents re-alerting for historical documents on initial snapshot delivery.
+    // Horodatage de démarrage du service — seuls les documents PLUS RÉCENTS sont alertés
     private val serviceStartTime = System.currentTimeMillis()
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Démarre en foreground avec une notification silencieuse (obligatoire Android O+)
         startForeground(NOTIF_ID_FOREGROUND, buildForegroundNotification())
-        attachFirestoreListener()
-        return START_STICKY   // restart automatically if killed by the OS
+        attachFirestoreListener() // commence à écouter la collection "notifications"
+        return START_STICKY       // redémarré par Android si tué
     }
 
+    // Attache le listener Firestore sur la collection "notifications" ciblant les CHAUFFEUR
     private fun attachFirestoreListener() {
-        firestoreReg?.remove()
+        firestoreReg?.remove() // supprime l'ancien listener si déjà actif
         firestoreReg = db.collection("notifications")
             .whereEqualTo("targetRole", "CHAUFFEUR")
             .addSnapshotListener { snap, err ->
@@ -52,13 +60,14 @@ class NotificationListenerService : Service() {
                     return@addSnapshotListener
                 }
                 snap?.documentChanges?.forEach { change ->
+                    // Seuls les nouveaux documents (pas les mises à jour ni suppressions)
                     if (change.type == DocumentChange.Type.ADDED) {
                         val createdAt = change.document.getLong("createdAt") ?: 0L
+                        // Ignore les documents antérieurs au démarrage du service (historique)
                         if (createdAt >= serviceStartTime) {
                             val message = change.document.getString("message") ?: return@forEach
                             val reservationId = change.document.getString("reservationId")
-                            // Use the Firestore docId as notification ID — same ID used by
-                            // TaxiPilotMessagingService — so only one banner shows per alert.
+                            // ID partagé avec TaxiPilotMessagingService → pas de doublon
                             showCourseNotification(
                                 message      = message,
                                 notifId      = change.document.id.hashCode(),
@@ -70,6 +79,8 @@ class NotificationListenerService : Service() {
             }
     }
 
+    // Affiche une notification Android heads-up avec vibration pour alerter le chauffeur
+    // Taper dessus ouvre MainActivity et navigue vers la réservation si reservationId est fourni
     private fun showCourseNotification(
         message: String,
         notifId: Int,
@@ -88,9 +99,9 @@ class NotificationListenerService : Service() {
             .setContentTitle("Nouvelle course disponible")
             .setContentText(message)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setPriority(NotificationCompat.PRIORITY_HIGH) // bandeau heads-up
             .setAutoCancel(true)
-            .setVibrate(longArrayOf(0, 400, 200, 400))
+            .setVibrate(longArrayOf(0, 400, 200, 400))     // vibration pour attirer l'attention
             .setContentIntent(pendingIntent)
             .build()
 
@@ -98,28 +109,29 @@ class NotificationListenerService : Service() {
         manager.notify(notifId, notif)
     }
 
-    /** Silent, minimal notification required to keep the foreground service alive. */
+    // Notification foreground silencieuse — requise pour maintenir le service en vie (Android O+)
     private fun buildForegroundNotification() =
         NotificationCompat.Builder(this, TaxiPilotApp.CHANNEL_SERVICE)
             .setContentTitle("TaxiPilot")
             .setContentText("En attente de nouvelles courses…")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setPriority(NotificationCompat.PRIORITY_MIN)
-            .setSilent(true)
-            .setOngoing(true)
+            .setSilent(true)  // pas de son ni de vibration pour la notification de service
+            .setOngoing(true) // non supprimable par l'utilisateur
             .build()
 
     override fun onDestroy() {
-        firestoreReg?.remove()
+        firestoreReg?.remove() // supprime le listener Firestore pour éviter les fuites mémoire
         firestoreReg = null
         super.onDestroy()
     }
 
-    override fun onBind(intent: Intent?): IBinder? = null
+    override fun onBind(intent: Intent?): IBinder? = null // pas de binding (service démarré, pas lié)
 
     companion object {
-        private const val NOTIF_ID_FOREGROUND = 9001
+        private const val NOTIF_ID_FOREGROUND = 9001 // ID fixe de la notification foreground
 
+        // Démarre le service (startForegroundService sur Android O+, startService sinon)
         fun start(context: Context) {
             val intent = Intent(context, NotificationListenerService::class.java)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -129,6 +141,7 @@ class NotificationListenerService : Service() {
             }
         }
 
+        // Arrête le service et supprime le listener Firestore
         fun stop(context: Context) {
             context.stopService(Intent(context, NotificationListenerService::class.java))
         }

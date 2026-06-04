@@ -1,5 +1,16 @@
 package com.example.taxipilot.core.data.repository
 
+// Repository Firestore pour les réservations — SOURCE DE VÉRITÉ principale du flux de booking.
+// Toutes les opérations sur les réservations passent par ce fichier.
+//
+// Architecture des flux :
+//   - snapshotFlow() : wraps un listener Firestore en Flow Kotlin (temps réel)
+//   - Les erreurs Firestore (PERMISSION_DENIED, index manquant, réseau) émettent une liste vide
+//     et ne ferment PAS le Flow → l'app reste vivante et se reconnecte automatiquement.
+//
+// Opération critique : accept() utilise une TRANSACTION Firestore pour éviter
+// que deux chauffeurs acceptent la même course simultanément (first-come-first-served).
+
 import android.util.Log
 import com.example.taxipilot.core.data.firestore.FirestoreReservation
 import com.google.firebase.firestore.DocumentSnapshot
@@ -16,55 +27,45 @@ private const val TAG = "FirestoreReservations"
 class FirestoreReservationRepository {
 
     private val db  = FirebaseFirestore.getInstance()
-    private val col = db.collection("reservations")
+    private val col = db.collection("reservations") // collection principale Firestore
 
-    // ── Create ────────────────────────────────────────────────────────────────
+    // ── Création ──────────────────────────────────────────────────────────────
 
+    // Crée une nouvelle réservation dans Firestore et retourne son ID généré
     suspend fun create(reservation: FirestoreReservation): String {
-        val doc    = col.document()
-        val withId = reservation.copy(id = doc.id)
+        val doc    = col.document()              // génère un ID unique Firestore
+        val withId = reservation.copy(id = doc.id) // on stocke l'ID dans le document aussi
         doc.set(withId.toMap()).await()
         return doc.id
     }
 
-    // ── Real-time flows ───────────────────────────────────────────────────────
+    // ── Flux temps réel ───────────────────────────────────────────────────────
 
-    /**
-     * All EN_ATTENTE reservations — chauffeur "available" feed.
-     *
-     * NOTE: No orderBy here to avoid needing a composite Firestore index.
-     * Results are sorted in-memory by createdAt ascending.
-     */
+    // Réservations EN_ATTENTE (feed "disponibles" pour les chauffeurs), triées par date de création
+    // Pas d'orderBy Firestore pour éviter un index composite — tri fait en mémoire
     fun getAvailable(): Flow<List<FirestoreReservation>> = snapshotFlow(
         query = col.whereEqualTo("status", FirestoreReservation.STATUS_EN_ATTENTE)
     ).map { list -> list.sortedBy { it.createdAt } }
 
-    /**
-     * Reservations assigned to a specific chauffeur, sorted newest first.
-     */
+    // Réservations assignées à un chauffeur précis (son historique + course active)
     fun getByChauffeur(chauffeurId: String): Flow<List<FirestoreReservation>> = snapshotFlow(
         query = col.whereEqualTo("chauffeurId", chauffeurId)
     ).map { list -> list.sortedByDescending { it.createdAt } }
 
-    /**
-     * Reservations made by a specific client, sorted newest first.
-     */
+    // Réservations faites par un client précis (son historique de courses)
     fun getByClient(clientId: String): Flow<List<FirestoreReservation>> = snapshotFlow(
         query = col.whereEqualTo("clientId", clientId)
     ).map { list -> list.sortedByDescending { it.createdAt } }
 
-    /**
-     * All reservations — Propriétaire overview, sorted newest first.
-     */
+    // Toutes les réservations (vue globale pour le propriétaire)
     fun getAll(): Flow<List<FirestoreReservation>> = snapshotFlow(query = col)
         .map { list -> list.sortedByDescending { it.createdAt } }
 
-    // ── Atomic accept (first-come-first-served) ───────────────────────────────
+    // ── Acceptation atomique (first-come-first-served) ────────────────────────
 
-    /**
-     * Atomically claims a reservation for a chauffeur.
-     * Returns true on success, false if someone else was faster or reservation not found.
-     */
+    // Tente de réserver une course pour un chauffeur.
+    // Utilise une transaction Firestore pour éviter les doubles acceptations.
+    // Retourne true si succès, false si la course est déjà prise ou introuvable.
     suspend fun accept(
         reservationId: String,
         chauffeurId: String,
@@ -76,6 +77,7 @@ class FirestoreReservationRepository {
             val ref     = col.document(reservationId)
             val snap    = tx.get(ref)
             val current = snap.toReservation() ?: throw Exception("not_found")
+            // Si la réservation n'est plus EN_ATTENTE, quelqu'un d'autre a été plus rapide
             if (current.status != FirestoreReservation.STATUS_EN_ATTENTE) {
                 throw Exception("already_taken")
             }
@@ -95,11 +97,13 @@ class FirestoreReservationRepository {
         false
     }
 
-    // ── Status transitions ────────────────────────────────────────────────────
+    // ── Transitions de statut ─────────────────────────────────────────────────
 
+    // Chauffeur démarre la course → statut passe à EN_COURS
     suspend fun demarrer(reservationId: String) =
         col.document(reservationId).update("status", FirestoreReservation.STATUS_EN_COURS).await()
 
+    // Chauffeur termine la course → enregistre le prix final, la distance réelle et l'heure de fin
     suspend fun terminer(reservationId: String, prixFinal: Double, distanceReelle: Double) =
         col.document(reservationId).update(
             mapOf(
@@ -110,48 +114,39 @@ class FirestoreReservationRepository {
             )
         ).await()
 
-    /**
-     * All reservations where this proprietaire's chauffeurs completed the trip.
-     */
+    // Réservations des chauffeurs d'un propriétaire (pour le tableau de bord owner)
     fun getByProprietaire(proprietaireId: String): Flow<List<FirestoreReservation>> = snapshotFlow(
         query = col.whereEqualTo("proprietaireId", proprietaireId)
     ).map { list -> list.sortedByDescending { it.createdAt } }
 
+    // Client annule sa réservation
     suspend fun cancel(reservationId: String) =
         col.document(reservationId).update("status", FirestoreReservation.STATUS_ANNULEE).await()
 
-    // ── Internal: safe snapshot flow ──────────────────────────────────────────
+    // ── Flux snapshot interne (factorisation) ─────────────────────────────────
 
-    /**
-     * Wraps a Firestore query in a callbackFlow.
-     *
-     * Errors (PERMISSION_DENIED, FAILED_PRECONDITION / missing index, network) are
-     * logged and converted to an empty list — the listener stays registered and
-     * will recover automatically once conditions improve (rules fixed, index created,
-     * connection restored).  We never call close(err) so the flow never terminates
-     * with an exception, which would otherwise crash via viewModelScope.
-     */
+    // Wraps une requête Firestore en Flow Kotlin avec gestion sécurisée des erreurs.
+    // Les erreurs émettent une liste vide (pas de crash) et le listener reste actif.
     private fun snapshotFlow(
         query: com.google.firebase.firestore.Query
     ): Flow<List<FirestoreReservation>> = callbackFlow {
         val reg = query.addSnapshotListener { snap, err ->
             if (err != null) {
                 Log.e(TAG, "Firestore error: ${err.code} — ${err.message}")
-                // Emit empty list so the app stays alive; Firestore will retry automatically.
-                trySend(emptyList())
+                trySend(emptyList()) // émet une liste vide pour garder l'UI en vie
                 return@addSnapshotListener
             }
             trySend(snap?.documents?.mapNotNull { it.toReservation() } ?: emptyList())
         }
-        awaitClose { reg.remove() }
+        awaitClose { reg.remove() } // supprime le listener quand le Flow est annulé
     }.catch { e ->
-        // Belt-and-suspenders: catch any unexpected flow errors
         Log.e(TAG, "Unexpected flow error: ${e.message}")
         emit(emptyList())
     }
 
-    // ── Deserialization ───────────────────────────────────────────────────────
+    // ── Désérialisation ───────────────────────────────────────────────────────
 
+    // Convertit un DocumentSnapshot Firestore en FirestoreReservation (retourne null si invalide)
     private fun DocumentSnapshot.toReservation(): FirestoreReservation? = runCatching {
         FirestoreReservation(
             id             = getString("id")            ?: id,

@@ -1,5 +1,22 @@
 package com.example.taxipilot.feature.driver
 
+// ViewModel de l'espace Chauffeur — gère tout le cycle de vie d'une course et les données du chauffeur.
+//
+// Responsabilités principales :
+//   1. Statut de service (en_service / hors_service / en_course)
+//      - observeStatut() : maintient _statut synchronisé avec Firestore en temps réel
+//      - toggleStatut() : bascule en_service ↔ hors_service, notifie le propriétaire, logue
+//   2. Réservations disponibles → filtres selon statut (vide si hors_service)
+//   3. Cycle de vie d'une course : accepterReservation() → demarrerCourse() → terminerCourse()
+//   4. Partage de position GPS : onLocationUpdate() (toutes les ~15 s) + stopLocationSharing()
+//   5. Résumé quotidien : combine myCourses (Firestore) + myCharges (Room)
+//   6. Commandes vocales : onVoiceResult() → VoiceParser → confirmPending() → DB
+//   7. Saisie manuelle : saveTrajetManuel() + saveChargeManuel()
+//
+// Vérification de proximité dans terminerCourse() :
+//   Si le chauffeur est à plus de 500 m de la destination → TerminerState.TooFar
+//   L'écran peut forcer la terminaison (forceTerminate = true).
+
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -17,22 +34,24 @@ import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import java.util.Calendar
 
-// ── UI state types ────────────────────────────────────────────────────────────
+// ── Types d'état UI ───────────────────────────────────────────────────────────
 
+// Résumé quotidien du chauffeur (onglet Résumé)
 data class DailySummaryUiState(
-    val firestoreCourses: List<FirestoreReservation> = emptyList(),
-    val charges: List<ChargeEntity> = emptyList(),
-    val totalRecettes: Double = 0.0,
-    val totalCharges: Double = 0.0,
-    val benefice: Double = 0.0,
-    val nbCourses: Int = 0
+    val firestoreCourses: List<FirestoreReservation> = emptyList(), // courses terminées aujourd'hui
+    val charges: List<ChargeEntity> = emptyList(),                  // dépenses du jour
+    val totalRecettes: Double = 0.0,                                // CA du jour
+    val totalCharges: Double = 0.0,                                 // dépenses du jour
+    val benefice: Double = 0.0,                                     // bénéfice = recettes - charges
+    val nbCourses: Int = 0                                          // nombre de courses terminées
 )
 
+// État de l'interface vocale
 sealed class VoiceUiState {
-    object Idle : VoiceUiState()
-    data class PendingConfirmation(val command: VoiceParser.VoiceCommand) : VoiceUiState()
-    data class Saved(val message: String) : VoiceUiState()
-    data class Error(val message: String) : VoiceUiState()
+    object Idle : VoiceUiState()                                            // aucune commande en cours
+    data class PendingConfirmation(val command: VoiceParser.VoiceCommand) : VoiceUiState() // attente confirmation
+    data class Saved(val message: String) : VoiceUiState()                 // enregistrement réussi
+    data class Error(val message: String) : VoiceUiState()                 // erreur
 }
 
 // ── ViewModel ────────────────────────────────────────────────────────────────
@@ -47,46 +66,41 @@ class DriverViewModel(
     private val firestoreChargeRepository: FirestoreChargeRepository = FirestoreChargeRepository(),
     private val firestoreNotificationRepository: FirestoreNotificationRepository = FirestoreNotificationRepository(),
     private val firestoreServiceLogRepository: FirestoreServiceLogRepository = FirestoreServiceLogRepository(),
-    val chauffeurId: Long,
-    val chauffeurUid: String,
+    val chauffeurId: Long,      // ID Room du chauffeur (dérivé de l'UID Firebase via toRoomId())
+    val chauffeurUid: String,   // UID Firebase du chauffeur (utilisé pour Firestore)
     val chauffeurNom: String = "",
-    /** Firestore UID of the proprietaire this chauffeur is linked to. */
-    val proprietaireId: String? = null,
-    /** Matricule of the taxi assigned to this chauffeur by the proprietaire. */
-    val assignedTaxi: String? = null,
-    /** Current service status from Firestore profile. */
+    val proprietaireId: String? = null,     // UID du propriétaire (null si non lié)
+    val assignedTaxi: String? = null,       // matricule du taxi assigné
     private val initialStatut: String = FirestoreUser.STATUT_EN_SERVICE
 ) : ViewModel() {
 
-    // ── Statut (en_service / hors_service / en_course) ────────────────────────
+    // ── Statut de service ─────────────────────────────────────────────────────
 
+    // Initialise le statut : traite l'ancien "disponible" comme "en_service"
     private val _statut = MutableStateFlow(
-        // Treat legacy "disponible" as en_service so old accounts work
         if (initialStatut == FirestoreUser.STATUT_DISPONIBLE) FirestoreUser.STATUT_EN_SERVICE
         else initialStatut
     )
     val statut: StateFlow<String> = _statut.asStateFlow()
 
-    // Declared before init so it's ready when init block runs
     private val _proprietaireInfo = MutableStateFlow<FirestoreUser?>(null)
     val proprietaireInfo: StateFlow<FirestoreUser?> = _proprietaireInfo.asStateFlow()
 
     init {
-        // Real-time Firestore snapshot listener — keeps _statut always in sync.
-        // This replaces the one-shot getStatut() and fixes the "stuck on hors_service" bug.
+        // Écoute le statut Firestore en temps réel → corrige le bug "statut figé sur hors_service"
         viewModelScope.launch {
             firestoreUserRepository.observeStatut(chauffeurUid).collect { firestoreStatut ->
                 _statut.value = if (firestoreStatut == FirestoreUser.STATUT_DISPONIBLE)
                     FirestoreUser.STATUT_EN_SERVICE else firestoreStatut
             }
         }
-        // Fetch proprietaire info for "Mon Employeur" section in the driver profile
+        // Charge les infos du propriétaire pour l'afficher dans l'écran de profil
         if (proprietaireId != null) {
             viewModelScope.launch {
                 _proprietaireInfo.value = firestoreUserRepository.getUser(proprietaireId)
             }
         }
-        // Auto-select the taxi assigned by proprietaire (for charge/trajet association)
+        // Pré-sélectionne le taxi assigné (pour associer les charges et trajets)
         if (assignedTaxi != null) {
             viewModelScope.launch {
                 val taxi = taxiRepository.getByImmatriculation(assignedTaxi)
@@ -95,18 +109,20 @@ class DriverViewModel(
         }
     }
 
+    // Bascule entre en_service ↔ hors_service
+    // Effets : mise à jour Firestore, mise à jour Room taxi, log, notification propriétaire
     fun toggleStatut() {
         val next = if (_statut.value == FirestoreUser.STATUT_HORS_SERVICE)
             FirestoreUser.STATUT_EN_SERVICE
         else
             FirestoreUser.STATUT_HORS_SERVICE
         viewModelScope.launch {
-            // 1. Update Firestore first — snapshot listener will confirm via _statut update
+            // 1. Firestore d'abord → le snapshot listener confirmera via _statut
             firestoreUserRepository.updateStatut(chauffeurUid, next)
-            // 2. Optimistic local update for immediate UI feedback
+            // 2. Mise à jour optimiste locale pour une UI instantanée
             _statut.value = next
 
-            // 2. Update local Room taxi status (Fix 6 — free/re-bind taxi on chauffeur's device)
+            // 3. Met à jour le statut Room du taxi (libre ou assigné)
             assignedTaxi?.let { matricule ->
                 val taxi = taxiRepository.getByImmatriculation(matricule)
                 if (taxi != null) {
@@ -116,7 +132,7 @@ class DriverViewModel(
                 }
             }
 
-            // 3. Log status change (Fix 8)
+            // 4. Enregistre le changement dans les logs de service
             if (proprietaireId != null) {
                 firestoreServiceLogRepository.log(
                     FirestoreServiceLog(
@@ -127,7 +143,7 @@ class DriverViewModel(
                     )
                 )
 
-                // 4. Notify proprietaire (Fix 7)
+                // 5. Notifie le propriétaire du changement de statut
                 val statusLabel = if (next == FirestoreUser.STATUT_EN_SERVICE)
                     "en service" else "hors service"
                 firestoreNotificationRepository.create(
@@ -143,17 +159,18 @@ class DriverViewModel(
         }
     }
 
+    // Met à jour le statut de service sans les notifications/logs (usage interne)
     private fun setStatut(newStatut: String) {
         _statut.value = newStatut
         viewModelScope.launch { firestoreUserRepository.updateStatut(chauffeurUid, newStatut) }
     }
 
-    // ── Last known location (for proximity check) ─────────────────────────────
+    // ── Position GPS (pour vérification de proximité à la fin) ───────────────
 
     private var lastLat: Double? = null
     private var lastLng: Double? = null
 
-    // ── Taxi selection (local Room) ───────────────────────────────────────────
+    // ── Sélection du taxi local (Room) ────────────────────────────────────────
 
     val allTaxis: StateFlow<List<TaxiEntity>> = taxiRepository.getAll()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
@@ -161,42 +178,47 @@ class DriverViewModel(
     private val _selectedTaxiId = MutableStateFlow<Long?>(null)
     val selectedTaxiId: StateFlow<Long?> = _selectedTaxiId.asStateFlow()
 
+    // Sélectionne manuellement un taxi (pour les chauffeurs sans taxi assigné par Firestore)
     fun selectTaxi(id: Long) { _selectedTaxiId.value = id }
 
-    // ── Firestore reservation flows ───────────────────────────────────────────
+    // ── Flux de réservations Firestore ────────────────────────────────────────
 
-    // When hors_service: return empty list and skip the Firestore listener entirely.
+    // Réservations disponibles (EN_ATTENTE) — liste vide si hors_service
     val availableReservations: StateFlow<List<FirestoreReservation>> =
         _statut.flatMapLatest { currentStatut ->
             if (currentStatut == FirestoreUser.STATUT_HORS_SERVICE) {
-                flowOf(emptyList())
+                flowOf(emptyList()) // pas de courses affichées quand hors service
             } else {
                 firestoreReservationRepository.getAvailable()
             }
         }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
+    // Toutes les réservations du chauffeur (historique + course active)
     val myCourses: StateFlow<List<FirestoreReservation>> =
         firestoreReservationRepository.getByChauffeur(chauffeurUid)
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
+    // true si une course est en cours (ACCEPTEE ou EN_COURS)
     val hasActiveReservation: StateFlow<Boolean> =
         myCourses.map { list ->
             list.any { it.status == FirestoreReservation.STATUS_ACCEPTEE ||
                        it.status == FirestoreReservation.STATUS_EN_COURS }
         }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
 
+    // La réservation actuellement EN_COURS (null si aucune)
     val activeReservation: StateFlow<FirestoreReservation?> =
         myCourses.map { list ->
             list.firstOrNull { it.status == FirestoreReservation.STATUS_EN_COURS }
         }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
 
-    // ── Accept state ──────────────────────────────────────────────────────────
+    // ── État d'acceptation ────────────────────────────────────────────────────
 
     private val _acceptState = MutableStateFlow<AcceptState>(AcceptState.Idle)
     val acceptState: StateFlow<AcceptState> = _acceptState.asStateFlow()
 
+    // Tente d'accepter une réservation (transaction Firestore — first-come-first-served)
     fun accepterReservation(reservationId: String) {
-        if (_acceptState.value is AcceptState.Loading) return
+        if (_acceptState.value is AcceptState.Loading) return // évite le double-tap
         viewModelScope.launch {
             _acceptState.value = AcceptState.Loading
             val success = firestoreReservationRepository.accept(
@@ -212,14 +234,15 @@ class DriverViewModel(
 
     fun clearAcceptState() { _acceptState.value = AcceptState.Idle }
 
+    // États possibles lors d'une tentative d'acceptation
     sealed class AcceptState {
         object Idle    : AcceptState()
         object Loading : AcceptState()
         object Success : AcceptState()
-        object Taken   : AcceptState()
+        object Taken   : AcceptState() // quelqu'un d'autre a accepté en premier
     }
 
-    // ── Terminer state (tracks completion, surfaces errors) ───────────────────
+    // ── État de terminaison ───────────────────────────────────────────────────
 
     private val _terminerState = MutableStateFlow<TerminerState>(TerminerState.Idle)
     val terminerState: StateFlow<TerminerState> = _terminerState.asStateFlow()
@@ -230,18 +253,18 @@ class DriverViewModel(
         object Idle    : TerminerState()
         object Loading : TerminerState()
         object Success : TerminerState()
-        data class TooFar(val distanceMeters: Int) : TerminerState()
+        data class TooFar(val distanceMeters: Int) : TerminerState() // chauffeur trop loin de la destination
         data class Error(val message: String) : TerminerState()
     }
 
-    // ── Trip lifecycle ────────────────────────────────────────────────────────
+    // ── Cycle de vie d'une course ─────────────────────────────────────────────
 
+    // Démarre une course : statut Firestore → EN_COURS, statut local → en_course, statut taxi → EN_COURSE
     fun demarrerCourse(reservationId: String) {
         viewModelScope.launch {
             try {
                 firestoreReservationRepository.demarrer(reservationId)
                 setStatut(FirestoreUser.STATUT_EN_COURSE)
-                // Best-effort: update local Room taxi to EN_COURSE (no-op on chauffeur device if taxi not in Room)
                 assignedTaxi?.let { matricule ->
                     val taxi = taxiRepository.getByImmatriculation(matricule)
                     if (taxi != null) taxiRepository.updateStatut(taxi.id, TaxiStatut.EN_COURSE)
@@ -252,16 +275,21 @@ class DriverViewModel(
         }
     }
 
+    // Termine une course :
+    //   1. Vérification de proximité (500 m max) sauf forceTerminate
+    //   2. Mise à jour Firestore (terminee + prixFinal + distanceReelle)
+    //   3. Arrêt du partage de position
+    //   4. Retour au statut en_service, taxi → ASSIGNE
     fun terminerCourse(
         reservation: FirestoreReservation,
         prixFinal: Double,
         distanceReelle: Double,
-        forceTerminate: Boolean = false
+        forceTerminate: Boolean = false // true = ignorer la vérification de proximité
     ) {
         viewModelScope.launch {
             _terminerState.value = TerminerState.Loading
 
-            // Proximity check: warn if chauffeur is more than 500 m from destination
+            // Vérification : chauffeur doit être à moins de 500 m de la destination
             val arrLat = reservation.arriveeLat
             val arrLng = reservation.arriveeLng
             if (!forceTerminate && arrLat != null && arrLng != null) {
@@ -281,8 +309,7 @@ class DriverViewModel(
                     reservation.id, prixFinal, distanceReelle
                 )
                 stopLocationSharing()
-                setStatut(FirestoreUser.STATUT_EN_SERVICE)
-                // Best-effort: restore taxi to ASSIGNE after trip ends
+                setStatut(FirestoreUser.STATUT_EN_SERVICE) // retour en service
                 assignedTaxi?.let { matricule ->
                     val taxi = taxiRepository.getByImmatriculation(matricule)
                     if (taxi != null) taxiRepository.updateStatut(taxi.id, TaxiStatut.ASSIGNE)
@@ -297,8 +324,10 @@ class DriverViewModel(
         }
     }
 
-    // ── Location sharing ──────────────────────────────────────────────────────
+    // ── Partage de position GPS ───────────────────────────────────────────────
 
+    // Met à jour la position GPS dans Firestore et LocationRepository (carte flotte)
+    // Appelé par DriverScreen toutes les ~15 s via LocationTracker
     fun onLocationUpdate(lat: Double, lng: Double, destination: String) {
         lastLat = lat
         lastLng = lng
@@ -314,6 +343,7 @@ class DriverViewModel(
         }
     }
 
+    // Supprime la position GPS de Firestore (appelé quand la course se termine)
     fun stopLocationSharing() {
         viewModelScope.launch {
             locationRepository.removeLocation(chauffeurUid)
@@ -321,25 +351,27 @@ class DriverViewModel(
         }
     }
 
-    // ── Daily summary — uses Firestore terminee courses + Room charges ─────────
+    // ── Résumé quotidien ──────────────────────────────────────────────────────
 
+    // Charges du taxi sélectionné (ou toutes si aucun taxi sélectionné)
     val myCharges: StateFlow<List<ChargeEntity>> = combine(
         chargeRepository.getAll(), _selectedTaxiId
     ) { charges, taxiId ->
         if (taxiId != null) charges.filter { it.taxiId == taxiId } else charges
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
-    /** All charges regardless of selected taxi — for history tab. */
+    // Toutes les charges (pour l'onglet Historique, sans filtre de taxi)
     val allChargesHistory: StateFlow<List<ChargeEntity>> = chargeRepository.getAll()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
+    // Combine courses Firestore + charges Room pour calculer le bilan du jour
     val dailySummary: StateFlow<DailySummaryUiState> = combine(
         myCourses, myCharges
     ) { courses, charges ->
         val start = todayStart()
         val end   = todayEnd()
 
-        // Revenue = terminee courses completed today (uses completedAt, falls back to createdAt)
+        // Courses terminées aujourd'hui (completedAt en priorité, createdAt en fallback)
         val todayCourses = courses.filter {
             it.status == FirestoreReservation.STATUS_TERMINEE &&
             (it.completedAt ?: it.createdAt) in start..end
@@ -359,22 +391,23 @@ class DriverViewModel(
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), DailySummaryUiState())
 
-    // ── Voice state machine ───────────────────────────────────────────────────
+    // ── Machine à états vocale ────────────────────────────────────────────────
 
     private val _voiceUiState = MutableStateFlow<VoiceUiState>(VoiceUiState.Idle)
     val voiceUiState: StateFlow<VoiceUiState> = _voiceUiState.asStateFlow()
 
+    // Traite le texte reconnu par la reconnaissance vocale
     fun onVoiceResult(text: String) {
         val command = VoiceParser.parse(text)
         when (command) {
             is VoiceParser.VoiceCommand.NouveauTrajet,
             is VoiceParser.VoiceCommand.NouvelleCharge ->
-                _voiceUiState.value = VoiceUiState.PendingConfirmation(command)
+                _voiceUiState.value = VoiceUiState.PendingConfirmation(command) // attente confirmation
             is VoiceParser.VoiceCommand.Reponse -> {
                 val pending = _voiceUiState.value as? VoiceUiState.PendingConfirmation
                 if (pending != null) {
-                    if (command.confirmee) confirmPending(pending.command)
-                    else _voiceUiState.value = VoiceUiState.Idle
+                    if (command.confirmee) confirmPending(pending.command) // "oui" → enregistre
+                    else _voiceUiState.value = VoiceUiState.Idle            // "non" → annule
                 }
             }
             VoiceParser.VoiceCommand.Incompris ->
@@ -384,6 +417,7 @@ class DriverViewModel(
         }
     }
 
+    // Confirme une commande vocale en attente → enregistre en DB
     fun confirmPending(command: VoiceParser.VoiceCommand) {
         viewModelScope.launch {
             try {
@@ -401,11 +435,12 @@ class DriverViewModel(
     fun dismissVoiceState() { _voiceUiState.value = VoiceUiState.Idle }
     fun onVoiceError(message: String) { _voiceUiState.value = VoiceUiState.Error(message) }
 
-    // ── Manual save ───────────────────────────────────────────────────────────
+    // ── Saisie manuelle ───────────────────────────────────────────────────────
 
     private val _manualSaveState = MutableStateFlow<ManualSaveState>(ManualSaveState.Idle)
     val manualSaveState: StateFlow<ManualSaveState> = _manualSaveState.asStateFlow()
 
+    // Enregistre un trajet manuellement (formulaire dans l'onglet Résumé)
     fun saveTrajetManuel(
         depart: String, arrivee: String,
         distanceKm: Double?, montant: Double?
@@ -431,11 +466,11 @@ class DriverViewModel(
         }
     }
 
+    // Enregistre une charge manuellement (formulaire) + la mirore dans Firestore
     fun saveChargeManuel(type: TypeCharge, description: String, montant: Double) {
         viewModelScope.launch {
             try {
-                // Auto-resolve taxi: prefer already-resolved local ID,
-                // fall back to a live DB lookup by matricule (handles init race condition).
+                // Résolution du taxi : ID local ou lookup par matricule (gère la race condition d'init)
                 val taxiId = _selectedTaxiId.value ?: assignedTaxi?.let {
                     taxiRepository.getByImmatriculation(it)?.id
                 }
@@ -445,13 +480,12 @@ class DriverViewModel(
                     )
                     return@launch
                 }
-                // Cache for future calls within this session
-                if (_selectedTaxiId.value == null) _selectedTaxiId.value = taxiId
+                if (_selectedTaxiId.value == null) _selectedTaxiId.value = taxiId // cache pour futures appels
 
                 chargeRepository.insert(
                     ChargeEntity(taxiId = taxiId, type = type, description = description, montant = montant)
                 )
-                // Mirror to Firestore so proprietaire can see it
+                // Mirore dans Firestore pour que le propriétaire la voie sur son dashboard
                 if (proprietaireId != null) {
                     firestoreChargeRepository.create(
                         FirestoreCharge(
@@ -478,7 +512,7 @@ class DriverViewModel(
         data class Error(val message: String) : ManualSaveState()
     }
 
-    // ── DB writes (voice) ─────────────────────────────────────────────────────
+    // ── Enregistrement vocal interne ──────────────────────────────────────────
 
     private suspend fun saveTrajet(cmd: VoiceParser.VoiceCommand.NouveauTrajet) {
         val now = System.currentTimeMillis()
@@ -501,8 +535,6 @@ class DriverViewModel(
     }
 
     private suspend fun saveCharge(cmd: VoiceParser.VoiceCommand.NouvelleCharge) {
-        // Auto-resolve taxi: prefer already-resolved local ID,
-        // fall back to a live DB lookup by matricule (handles init race condition).
         val taxiId = _selectedTaxiId.value ?: assignedTaxi?.let {
             taxiRepository.getByImmatriculation(it)?.id
         }
@@ -512,7 +544,6 @@ class DriverViewModel(
             )
             return
         }
-        // Cache for future calls within this session
         if (_selectedTaxiId.value == null) _selectedTaxiId.value = taxiId
         val montant = cmd.montant ?: 0.0
         chargeRepository.insert(
@@ -521,7 +552,6 @@ class DriverViewModel(
                 description = cmd.description, montant = montant
             )
         )
-        // Mirror to Firestore so proprietaire can see it
         if (proprietaireId != null) {
             firestoreChargeRepository.create(
                 FirestoreCharge(
@@ -540,17 +570,18 @@ class DriverViewModel(
         _voiceUiState.value = VoiceUiState.Saved(msg)
     }
 
-    // ── Utils ─────────────────────────────────────────────────────────────────
+    // ── Utilitaires ───────────────────────────────────────────────────────────
 
+    // Timestamp de minuit du jour courant
     private fun todayStart(): Long = Calendar.getInstance().apply {
         set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0)
         set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
     }.timeInMillis
 
+    // Timestamp de 23:59:59.999 du jour courant
     private fun todayEnd(): Long = todayStart() + 86_400_000L - 1L
 
-    // ── Factory ───────────────────────────────────────────────────────────────
-
+    // ── Factory manuelle (pas de Hilt) ────────────────────────────────────────
     class Factory(
         private val trajetRepository: TrajetRepository,
         private val chargeRepository: ChargeRepository,

@@ -1,22 +1,33 @@
 package com.example.taxipilot.auth
 
+// Modèle de profil utilisateur côté app (Firebase Auth + Firestore).
+// Représente le document Firestore collection "users" mappé pour l'usage dans l'app.
+// Distinct de FirestoreUser (utilisé dans les modules feature) pour éviter la dépendance circulaire.
+//
+// Champs spécifiques par rôle :
+//   PROPRIETAIRE : codeProprietaire (6 chiffres, partagé avec ses chauffeurs)
+//   CHAUFFEUR    : proprietaireId, assignedTaxi (matricule), statut
+//
+// toMap() sérialise le profil pour l'écriture dans Firestore lors de l'inscription.
+
 data class UserProfile(
-    val uid: String = "",
-    val email: String = "",
-    val nom: String = "",
-    val telephone: String = "",
+    val uid: String = "",              // UID Firebase Auth (identifiant unique global)
+    val email: String = "",            // email de connexion
+    val nom: String = "",              // nom complet
+    val telephone: String = "",        // numéro de téléphone
     val role: UserRole = UserRole.CLIENT,
-    val fcmToken: String? = null,
+    val fcmToken: String? = null,      // jeton FCM pour les notifications push
     val createdAt: Long = System.currentTimeMillis(),
-    // Proprietaire: unique 6-digit code shared with their chauffeurs
+    // Propriétaire seulement : code à 6 chiffres partagé avec ses chauffeurs pour le liage
     val codeProprietaire: String? = null,
-    // Chauffeur: set after entering proprietaire code
+    // Chauffeur seulement : UID du propriétaire auquel il est lié (null tant que non lié)
     val proprietaireId: String? = null,
-    // Chauffeur: matricule of assigned taxi (set by proprietaire)
+    // Chauffeur seulement : matricule du taxi assigné par son propriétaire
     val assignedTaxi: String? = null,
-    // Chauffeur: disponible | en_course
+    // Chauffeur seulement : "disponible" | "en_service" | "hors_service" | "en_course"
     val statut: String = "disponible"
 ) {
+    // Sérialise le profil en Map pour set() dans Firestore (utilisé à l'inscription)
     fun toMap(): Map<String, Any?> = mapOf(
         "uid"              to uid,
         "email"            to email,

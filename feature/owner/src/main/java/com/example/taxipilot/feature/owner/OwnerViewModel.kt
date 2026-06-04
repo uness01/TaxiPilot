@@ -1,5 +1,19 @@
 package com.example.taxipilot.feature.owner
 
+// ViewModel de l'espace Propriétaire — agrège toutes les données de la flotte et du tableau de bord.
+//
+// Sources de données :
+//   - Room (local)     : taxis, chauffeurs, trajets, charges → TaxiRepository, ChauffeurRepository, etc.
+//   - Firestore (cloud): réservations, chauffeurs liés, charges des chauffeurs, notifications, logs
+//
+// Flux principal (dashboardState) :
+//   combine(taxis, chauffeurs, firestoreCharges, allReservations, myChauffeurs) →
+//   calcule recettes, charges, bénéfice, stats par chauffeur (courses du jour, CA du jour)
+//
+// Code propriétaire :
+//   getOrGenerateProprietaireCode() : récupère ou crée le code 6 chiffres à l'init
+//   regenerateCode() : génère un nouveau code si le propriétaire veut le changer
+
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -13,26 +27,28 @@ import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import java.util.Calendar
 
+// État du tableau de bord propriétaire
 data class DashboardUiState(
-    val totalRecettes: Double = 0.0,
-    val totalCharges: Double = 0.0,
-    val benefice: Double = 0.0,
-    val nbTaxis: Int = 0,
-    val nbChauffeursActifs: Int = 0,
-    val nbTrajetsTermines: Int = 0,
-    val nbReservationsEnAttente: Int = 0,
-    val nbReservationsEnCours: Int = 0,
-    val chargesParType: Map<String, Double> = emptyMap(),
-    val chauffeurStats: List<ChauffeurStat> = emptyList()
+    val totalRecettes: Double = 0.0,          // total des recettes (réservations terminées)
+    val totalCharges: Double = 0.0,           // total des dépenses (Firestore charges)
+    val benefice: Double = 0.0,               // bénéfice = recettes - charges
+    val nbTaxis: Int = 0,                     // nombre de taxis dans la flotte Room
+    val nbChauffeursActifs: Int = 0,          // chauffeurs avec statut ACTIF dans Room
+    val nbTrajetsTermines: Int = 0,           // réservations Firestore terminées
+    val nbReservationsEnAttente: Int = 0,     // réservations en attente d'un chauffeur
+    val nbReservationsEnCours: Int = 0,       // courses en cours actuellement
+    val chargesParType: Map<String, Double> = emptyMap(), // dépenses ventilées par type
+    val chauffeurStats: List<ChauffeurStat> = emptyList() // stats par chauffeur (triées par CA)
 )
 
+// Statistiques quotidiennes pour un chauffeur dans le tableau de bord
 data class ChauffeurStat(
-    val uid: String,
-    val nom: String,
-    val statut: String,
-    val assignedTaxi: String?,
-    val tripsToday: Int,
-    val revenueToday: Double
+    val uid: String,          // UID Firebase du chauffeur
+    val nom: String,          // nom affiché
+    val statut: String,       // en_service / hors_service / en_course
+    val assignedTaxi: String?, // matricule du taxi assigné
+    val tripsToday: Int,      // nombre de courses terminées aujourd'hui
+    val revenueToday: Double  // CA généré aujourd'hui
 )
 
 class OwnerViewModel(
@@ -45,34 +61,32 @@ class OwnerViewModel(
     private val firestoreChargeRepository: FirestoreChargeRepository = FirestoreChargeRepository(),
     private val firestoreNotificationRepository: FirestoreNotificationRepository = FirestoreNotificationRepository(),
     private val firestoreServiceLogRepository: FirestoreServiceLogRepository = FirestoreServiceLogRepository(),
-    val proprietaireId: String,
-    codeProprietaireInitial: String? = null
+    val proprietaireId: String, // UID Firebase du propriétaire connecté
+    codeProprietaireInitial: String? = null // code passé depuis le profil (peut être null si vieux compte)
 ) : ViewModel() {
 
-    // ── Proprietaire code (always loaded from Firestore, generated if missing) ──
+    // ── Code propriétaire ─────────────────────────────────────────────────────
 
     private val _codeProprietaire = MutableStateFlow<String?>(codeProprietaireInitial)
     val codeProprietaire: StateFlow<String?> = _codeProprietaire.asStateFlow()
 
     init {
-        // Always verify/fetch the code — handles old accounts missing the field
-        // and the first render where the profile may not have carried it yet
+        // Vérifie/génère le code au démarrage pour les vieux comptes sans code
         viewModelScope.launch {
             val code = firestoreUserRepository.getOrGenerateProprietaireCode(proprietaireId)
             if (code != null) _codeProprietaire.value = code
         }
     }
 
-    /**
-     * Generate a new unique 6-character alphanumeric code and update Firestore.
-     * Already-linked chauffeurs are NOT affected.
-     */
+    // Génère un nouveau code unique et invalide l'ancien (les chauffeurs déjà liés ne sont pas affectés)
     fun regenerateCode() {
         viewModelScope.launch {
             val newCode = firestoreUserRepository.regenerateProprietaireCode(proprietaireId)
             if (newCode != null) _codeProprietaire.value = newCode
         }
     }
+
+    // ── Flux Room (données locales de la flotte) ──────────────────────────────
 
     val allTaxis: StateFlow<List<TaxiEntity>> = taxiRepository.getAll()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
@@ -86,41 +100,35 @@ class OwnerViewModel(
     val allCharges: StateFlow<List<ChargeEntity>> = chargeRepository.getAll()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
-    // ── Firestore — all reservations (global view for Réservations tab) ────────
+    // ── Flux Firestore (données cloud) ────────────────────────────────────────
 
+    // Toutes les réservations Firestore (vue globale de l'onglet Réservations)
     val allReservations: StateFlow<List<FirestoreReservation>> =
         firestoreReservationRepository.getAll()
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
-    // ── Firestore — chauffeurs linked to this proprietaire ────────────────────
-
+    // Chauffeurs liés à ce propriétaire (via proprietaireId dans Firestore)
     val myChauffeurs: StateFlow<List<FirestoreUser>> =
         firestoreUserRepository.getChauffeursByProprietaire(proprietaireId)
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
-    // ── Firestore charges (from all linked chauffeurs) ────────────────────────
-
+    // Charges déclarées par les chauffeurs de ce propriétaire (mirrorées depuis Room)
     val firestoreCharges: StateFlow<List<FirestoreCharge>> =
         firestoreChargeRepository.getByProprietaire(proprietaireId)
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
-    // ── Proprietaire notifications (chauffeur status changes) ─────────────────
-
-    /**
-     * Emits notification messages as they arrive targeting this proprietaire.
-     * Each emission is a new message string to display as a Snackbar.
-     */
+    // Messages de changement de statut des chauffeurs (ex : "Chauffeur X est en service")
+    // Émis en temps réel → OwnerScreen les affiche dans un Snackbar
     val driverStatusMessages: Flow<String> =
         firestoreNotificationRepository.getNewMessagesForProprietaire(proprietaireId)
 
-    // ── Service logs ──────────────────────────────────────────────────────────
-
-    /** One-shot fetch of service log entries for a chauffeur. */
+    // Récupère l'historique des logs de service d'un chauffeur (one-shot)
     suspend fun getServiceLogs(chauffeurUid: String): List<FirestoreServiceLog> =
         firestoreServiceLogRepository.getByChauffeur(chauffeurUid)
 
-    // ── Dashboard ─────────────────────────────────────────────────────────────
+    // ── Tableau de bord (combinaison de tous les flux) ────────────────────────
 
+    // combine() écoute 5 flux simultanément et recalcule l'état à chaque changement
     val dashboardState: StateFlow<DashboardUiState> = combine(
         taxiRepository.getAll(),
         chauffeurRepository.getAll(),
@@ -130,7 +138,7 @@ class OwnerViewModel(
     ) { taxis, chauffeurs, fsCharges, reservations, myChauffeurList ->
         val myChauffeurUids = myChauffeurList.map { it.uid }.toSet()
 
-        // Revenue = prixFinal from terminee reservations by our chauffeurs
+        // Recettes = somme des prixFinal (ou prixEstime) des réservations terminées par nos chauffeurs
         val myReservations = reservations.filter { it.chauffeurId in myChauffeurUids }
         val recettes = myReservations
             .filter { it.status == FirestoreReservation.STATUS_TERMINEE }
@@ -138,7 +146,7 @@ class OwnerViewModel(
 
         val totalCharges = fsCharges.sumOf { it.montant }
 
-        // Today's stats per chauffeur
+        // Stats du jour par chauffeur (courses terminées aujourd'hui)
         val todayStart = todayStartMillis()
         val todayEnd   = todayStart + 86_400_000L - 1L
         val chauffeurStats = myChauffeurList.map { ch ->
@@ -155,7 +163,7 @@ class OwnerViewModel(
                 tripsToday   = chReservations.size,
                 revenueToday = chReservations.sumOf { it.prixFinal ?: it.prixEstime }
             )
-        }.sortedByDescending { it.revenueToday }
+        }.sortedByDescending { it.revenueToday } // tri par CA décroissant
 
         DashboardUiState(
             totalRecettes           = recettes,
@@ -172,15 +180,16 @@ class OwnerViewModel(
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), DashboardUiState())
 
-    // ── Taxis ─────────────────────────────────────────────────────────────────
+    // ── Gestion des taxis (Room) ──────────────────────────────────────────────
 
     fun addTaxi(taxi: TaxiEntity)    = viewModelScope.launch { taxiRepository.insert(taxi) }
     fun updateTaxi(taxi: TaxiEntity) = viewModelScope.launch { taxiRepository.update(taxi) }
     fun deleteTaxi(taxi: TaxiEntity) = viewModelScope.launch { taxiRepository.delete(taxi) }
+    // Change le statut d'un taxi (DISPONIBLE, ASSIGNE, EN_COURSE, EN_MAINTENANCE)
     fun updateTaxiStatut(id: Long, statut: TaxiStatut) =
         viewModelScope.launch { taxiRepository.updateStatut(id, statut) }
 
-    // ── Room chauffeurs (local) ───────────────────────────────────────────────
+    // ── Gestion des chauffeurs locaux (Room) ──────────────────────────────────
 
     fun addChauffeur(c: ChauffeurEntity)    = viewModelScope.launch { chauffeurRepository.insert(c) }
     fun updateChauffeur(c: ChauffeurEntity) = viewModelScope.launch { chauffeurRepository.update(c) }
@@ -188,17 +197,18 @@ class OwnerViewModel(
     fun updateChauffeurStatut(id: Long, statut: ChauffeurStatut) =
         viewModelScope.launch { chauffeurRepository.updateStatut(id, statut) }
 
-    // ── Firestore chauffeur mutations ─────────────────────────────────────────
+    // ── Mutations Firestore (chauffeurs cloud) ────────────────────────────────
 
+    // Assigne un taxi à un chauffeur : écrit dans Firestore + met à jour le statut Room à ASSIGNE
     fun assignTaxiToChauffeur(chauffeurUid: String, taxiMatricule: String) {
         viewModelScope.launch {
             firestoreUserRepository.assignTaxiToChauffeur(chauffeurUid, taxiMatricule)
-            // Mark taxi as assigned in local Room so it disappears from the available list
             val taxi = taxiRepository.getByImmatriculation(taxiMatricule)
             if (taxi != null) taxiRepository.updateStatut(taxi.id, TaxiStatut.ASSIGNE)
         }
     }
 
+    // Retire le taxi d'un chauffeur : efface dans Firestore + remet le taxi à DISPONIBLE dans Room
     fun unassignTaxi(chauffeurUid: String, taxiMatricule: String?) {
         viewModelScope.launch {
             firestoreUserRepository.unassignTaxi(chauffeurUid)
@@ -209,20 +219,20 @@ class OwnerViewModel(
         }
     }
 
-    // ── Charges ───────────────────────────────────────────────────────────────
+    // ── Gestion des charges (Room) ────────────────────────────────────────────
 
     fun addCharge(charge: ChargeEntity)  = viewModelScope.launch { chargeRepository.insert(charge) }
     fun deleteCharge(charge: ChargeEntity) = viewModelScope.launch { chargeRepository.delete(charge) }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    // ── Utilitaires ───────────────────────────────────────────────────────────
 
+    // Retourne le timestamp du début du jour courant (minuit) en millisecondes
     private fun todayStartMillis(): Long = Calendar.getInstance().apply {
         set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0)
         set(Calendar.SECOND, 0);      set(Calendar.MILLISECOND, 0)
     }.timeInMillis
 
-    // ── Factory ───────────────────────────────────────────────────────────────
-
+    // ── Factory manuelle (pas de Hilt) ────────────────────────────────────────
     class Factory(
         private val taxiRepository: TaxiRepository,
         private val chauffeurRepository: ChauffeurRepository,

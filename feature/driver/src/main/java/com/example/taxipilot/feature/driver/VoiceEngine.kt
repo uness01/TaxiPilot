@@ -1,5 +1,19 @@
 package com.example.taxipilot.feature.driver
 
+// Moteur vocal — encapsule SpeechRecognizer (voix → texte) et TextToSpeech (texte → voix).
+//
+// Architecture :
+//   - SpeechRecognizer : API Android, nécessite le thread principal → créé dans DriverVoiceTab
+//   - TextToSpeech : initialisé avec fr-MA (français Maroc), fallback sur Locale.FRENCH
+//   - listenState : IDLE → LISTENING → PROCESSING → IDLE (suivi de l'état micro)
+//   - partialText : texte reconnu en temps réel (mise à jour pendant que l'utilisateur parle)
+//
+// Langues configurées :
+//   - Primaire : fr-MA (français Maroc)
+//   - Secondaire : ar-MA (arabe Maroc) — accepté mais non parsé par VoiceParser
+//
+// IMPORTANT : appeler destroy() dans DisposableEffect pour libérer les ressources Android.
+
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
@@ -13,17 +27,15 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.util.Locale
 
-/**
- * Wraps SpeechRecognizer + TextToSpeech.
- * Must be created on the main thread. Call [destroy] when done (DisposableEffect).
- */
 class VoiceEngine(private val context: Context) {
 
+    // États possibles de l'écoute micro
     enum class ListenState { IDLE, LISTENING, PROCESSING }
 
     private val _listenState = MutableStateFlow(ListenState.IDLE)
     val listenState: StateFlow<ListenState> = _listenState.asStateFlow()
 
+    // Texte partiellement reconnu (mis à jour en temps réel pendant l'écoute)
     private val _partialText = MutableStateFlow("")
     val partialText: StateFlow<String> = _partialText.asStateFlow()
 
@@ -31,25 +43,27 @@ class VoiceEngine(private val context: Context) {
     private var tts: TextToSpeech? = null
     private var ttsReady = false
 
+    // true si la reconnaissance vocale est disponible sur cet appareil
     val isAvailable: Boolean
         get() = SpeechRecognizer.isRecognitionAvailable(context)
 
     init {
+        // Initialise le moteur TTS avec fr-MA, fallback sur français générique
         tts = TextToSpeech(context) { status ->
             if (status == TextToSpeech.SUCCESS) {
-                // Prefer fr-MA; fall back to generic French if the locale is unavailable
                 val frMA = Locale("fr", "MA")
                 val result = tts?.setLanguage(frMA)
                 if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
-                    tts?.language = Locale.FRENCH
+                    tts?.language = Locale.FRENCH // fallback si fr-MA indisponible
                 }
                 ttsReady = true
             }
         }
     }
 
-    // ── Speech recognition ────────────────────────────────────────────────────
+    // ── Reconnaissance vocale ─────────────────────────────────────────────────
 
+    // Démarre l'écoute micro et appelle onResult avec le texte reconnu, ou onError si échec
     fun startListening(
         onResult: (String) -> Unit,
         onError: (String) -> Unit
@@ -69,9 +83,10 @@ class VoiceEngine(private val context: Context) {
                 override fun onRmsChanged(rmsdB: Float) {}
                 override fun onBufferReceived(buffer: ByteArray?) {}
                 override fun onEndOfSpeech() {
-                    _listenState.value = ListenState.PROCESSING
+                    _listenState.value = ListenState.PROCESSING // traitement en cours
                 }
                 override fun onPartialResults(results: Bundle) {
+                    // Met à jour le texte affiché en temps réel pendant l'écoute
                     val partial = results
                         .getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         ?.firstOrNull() ?: ""
@@ -95,25 +110,25 @@ class VoiceEngine(private val context: Context) {
 
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            // Primary: French (Morocco); ar-MA accepted as secondary
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "fr-MA")
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "fr-MA")             // langue principale
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "fr-MA")
             putExtra(RecognizerIntent.EXTRA_ONLY_RETURN_LANGUAGE_PREFERENCE, false)
-            // Offer Arabic-Morocco as additional language (supported on Google Speech)
-            putExtra("android.speech.extra.EXTRA_ADDITIONAL_LANGUAGES", arrayOf("ar-MA"))
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
+            putExtra("android.speech.extra.EXTRA_ADDITIONAL_LANGUAGES", arrayOf("ar-MA")) // langue secondaire
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true) // résultats partiels en temps réel
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)        // jusqu'à 5 hypothèses de reconnaissance
         }
         recognizer?.startListening(intent)
     }
 
+    // Arrête l'écoute manuellement (l'utilisateur a appuyé sur stop)
     fun stopListening() {
         recognizer?.stopListening()
         _listenState.value = ListenState.IDLE
     }
 
-    // ── Text-to-speech ────────────────────────────────────────────────────────
+    // ── Synthèse vocale (Text-to-Speech) ─────────────────────────────────────
 
+    // Lit le texte à voix haute et appelle onDone quand terminé
     fun speak(text: String, onDone: () -> Unit = {}) {
         if (!ttsReady) { onDone(); return }
         val id = "utt_${System.currentTimeMillis()}"
@@ -123,13 +138,15 @@ class VoiceEngine(private val context: Context) {
             @Deprecated("Deprecated in Java")
             override fun onError(utteranceId: String) = onDone()
         })
-        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, id)
+        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, id) // interrompt le discours en cours
     }
 
+    // Arrête la synthèse vocale immédiatement
     fun stopSpeaking() = tts?.stop()
 
-    // ── Lifecycle ────────────────────────────────────────────────────────────
+    // ── Cycle de vie ──────────────────────────────────────────────────────────
 
+    // Libère les ressources Android — DOIT être appelé dans DisposableEffect.onDispose()
     fun destroy() {
         recognizer?.destroy()
         recognizer = null
@@ -138,7 +155,7 @@ class VoiceEngine(private val context: Context) {
         tts = null
     }
 
-    // ── Helpers ──────────────────────────────────────────────────────────────
+    // ── Messages d'erreur traduits ────────────────────────────────────────────
 
     private fun recognitionErrorMessage(code: Int) = when (code) {
         SpeechRecognizer.ERROR_AUDIO             -> "Erreur audio."
